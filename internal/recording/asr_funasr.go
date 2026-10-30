@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,11 +15,12 @@ import (
 )
 
 const (
-	envFunASRBin           = "YOOOCLAW_ASR_BIN"
-	defaultFunASRTimeout   = 30 * time.Minute
-	maxFunASRStdoutBytes   = 8 << 20
-	maxFunASRStderrBytes   = 8 << 10
-	funasrAudioPlaceholder = "{audio}"
+	envFunASRBin            = "YOOOCLAW_ASR_BIN"
+	defaultFunASRTimeout    = 30 * time.Minute
+	maxFunASRStdoutBytes    = 8 << 20
+	maxFunASRStderrBytes    = 8 << 10
+	funasrAudioPlaceholder  = "{audio}"
+	funasrOutDirPlaceholder = "{outdir}"
 )
 
 // AsrFunASRConfig 是 asr.mode=funasr 的本地 CLI 配置。
@@ -33,14 +35,30 @@ type AsrFunASRConfig struct {
 // 优先级：配置里的 funasr.bin → YOOOCLAW_ASR_BIN → ~/.openclaw/tools/yoooclaw-asr/bin/yoooclaw-asr。
 func resolveFunASRBin(cfg *AsrConfig) string {
 	if cfg != nil && cfg.FunASR != nil {
-		if bin := strings.TrimSpace(cfg.FunASR.Bin); bin != "" {
+		if bin := expandUserPath(cfg.FunASR.Bin); bin != "" {
 			return bin
 		}
 	}
-	if bin := strings.TrimSpace(os.Getenv(envFunASRBin)); bin != "" {
+	if bin := expandUserPath(os.Getenv(envFunASRBin)); bin != "" {
 		return bin
 	}
 	return defaultFunASRBin()
+}
+
+// expandUserPath 把以 ~/ 开头的路径展开成绝对路径，便于 asr-config.json 写默认安装位置。
+func expandUserPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, strings.TrimPrefix(path, "~/"))
 }
 
 func defaultFunASRBin() string {
@@ -89,20 +107,38 @@ func funasrTimeout(cfg *AsrFunASRConfig) time.Duration {
 	return defaultFunASRTimeout
 }
 
-// funasrCommandArgs 组装 argv。args 中的 {audio} 换成绝对路径；
-// 没有占位符时把路径追加到末尾，保证二进制总能拿到本地音频。
-func funasrCommandArgs(cfg *AsrFunASRConfig, audioPath string) []string {
+// funasrArgsNeedOutDir 判断这次调用要不要准备临时输出目录。
+// 默认参数（空 args）对应 yoooclaw-asr run --audio {audio} --out-dir {outdir}。
+func funasrArgsNeedOutDir(cfg *AsrFunASRConfig) bool {
 	if cfg == nil || len(cfg.Args) == 0 {
-		return []string{audioPath}
+		return true
 	}
+	for _, arg := range cfg.Args {
+		if strings.Contains(arg, funasrOutDirPlaceholder) {
+			return true
+		}
+	}
+	return false
+}
+
+// funasrCommandArgs 组装 argv。
+// 未配置 args 时使用真实 yoooclaw-asr 的 run 子命令，而不是把音频路径当成唯一参数。
+// 自定义 args 里的 {audio}、{outdir} 会被替换；没有 {audio} 时才把音频路径补在末尾。
+func funasrCommandArgs(cfg *AsrFunASRConfig, audioPath, outDir string) []string {
+	if cfg == nil || len(cfg.Args) == 0 {
+		return []string{"run", "--audio", audioPath, "--out-dir", outDir}
+	}
+	replacer := strings.NewReplacer(
+		funasrAudioPlaceholder, audioPath,
+		funasrOutDirPlaceholder, outDir,
+	)
 	out := make([]string, 0, len(cfg.Args)+1)
 	sawAudio := false
 	for _, arg := range cfg.Args {
 		if strings.Contains(arg, funasrAudioPlaceholder) {
 			sawAudio = true
-			arg = strings.ReplaceAll(arg, funasrAudioPlaceholder, audioPath)
 		}
-		out = append(out, arg)
+		out = append(out, replacer.Replace(arg))
 	}
 	if !sawAudio {
 		out = append(out, audioPath)
@@ -115,7 +151,16 @@ func transcribeWithFunASR(audioFilePath string, cfg *AsrFunASRConfig, logger Log
 	if err := checkFunASRBin(bin); err != nil {
 		return TranscriptionResult{OK: false, Error: err.Error()}
 	}
-	args := funasrCommandArgs(cfg, audioFilePath)
+	outDir := ""
+	if funasrArgsNeedOutDir(cfg) {
+		dir, mkErr := os.MkdirTemp("", "yoooclaw-funasr-")
+		if mkErr != nil {
+			return TranscriptionResult{OK: false, Error: "FunASR 临时目录创建失败: " + mkErr.Error()}
+		}
+		defer os.RemoveAll(dir)
+		outDir = dir
+	}
+	args := funasrCommandArgs(cfg, audioFilePath, outDir)
 	ctx, cancel := context.WithTimeout(context.Background(), funasrTimeout(cfg))
 	defer cancel()
 
@@ -125,7 +170,7 @@ func transcribeWithFunASR(audioFilePath string, cfg *AsrFunASRConfig, logger Log
 	stderr.max = maxFunASRStderrBytes
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	logger.Info("[asr-funasr] 调用本地 CLI: bin=" + bin)
+	logger.Info("[asr-funasr] 调用本地 CLI: bin=" + bin + " argv=" + strings.Join(args, " "))
 
 	err := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
@@ -176,11 +221,19 @@ func (c *cappedBuffer) Bytes() []byte { return c.buf.Bytes() }
 func (c *cappedBuffer) String() string { return c.buf.String() }
 
 type funasrJSON struct {
+	Status     string          `json:"status"`
+	Error      string          `json:"error"`
+	Message    string          `json:"message"`
 	Text       string          `json:"text"`
 	Title      string          `json:"title"`
 	Summary    string          `json:"summary"`
+	Paths      funasrPaths     `json:"paths"`
 	Segments   []funasrSegment `json:"segments"`
 	Transcript []funasrSegment `json:"transcript"`
+}
+
+type funasrPaths struct {
+	TranscriptTxt string `json:"transcript_txt"`
 }
 
 type funasrSegment struct {
@@ -224,11 +277,47 @@ func parseFunASRJSON(text string) (TranscriptionResult, bool) {
 	if json.Unmarshal([]byte(text), &payload) != nil {
 		return TranscriptionResult{}, false
 	}
+	if status := strings.TrimSpace(payload.Status); status != "" && !strings.EqualFold(status, "ok") {
+		detail := firstNonEmpty(payload.Error, payload.Message, status)
+		return TranscriptionResult{OK: false, Error: "FunASR 状态异常: " + detail}, true
+	}
+	explicitText := payload.Text
+	// yoooclaw-asr run 把正文写在 paths.transcript_txt，顶层没有 text。
+	if path := strings.TrimSpace(payload.Paths.TranscriptTxt); path != "" {
+		body, err := readFunASRTranscriptFile(path)
+		if err != nil {
+			return TranscriptionResult{OK: false, Error: "FunASR 转写文件读取失败: " + err.Error()}, true
+		}
+		explicitText = body
+	}
 	segs := payload.Segments
 	if len(segs) == 0 {
 		segs = payload.Transcript
 	}
-	return funasrSegmentsResult(payload.Text, payload.Title, payload.Summary, segs, json.RawMessage(text)), true
+	return funasrSegmentsResult(explicitText, payload.Title, payload.Summary, segs, json.RawMessage(text)), true
+}
+
+func readFunASRTranscriptFile(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return "", errors.New("路径是目录")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, maxFunASRStdoutBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(body) > maxFunASRStdoutBytes {
+		return "", errors.New("超过上限")
+	}
+	return string(body), nil
 }
 
 func funasrSegmentsResult(explicitText, title, summary string, segs []funasrSegment, raw any) TranscriptionResult {

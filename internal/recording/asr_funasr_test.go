@@ -21,11 +21,11 @@ func writeFakeFunASR(t *testing.T, body string) string {
 func TestFunASRInvokesConfiguredBinaryAndMapsText(t *testing.T) {
 	argsFile := filepath.Join(t.TempDir(), "args.txt")
 	bin := writeFakeFunASR(t, `#!/bin/sh
-if [ "$#" -ne 1 ]; then
-  echo "expected 1 arg, got $#" >&2
+printf '%s\n' "$@" > `+shellQuote(argsFile)+`
+if [ "$1" != "run" ] || [ "$2" != "--audio" ] || [ "$4" != "--out-dir" ] || [ ! -d "$5" ]; then
+  echo "bad argv: $*" >&2
   exit 2
 fi
-printf '%s' "$1" > `+shellQuote(argsFile)+`
 printf '%s' '{"text":"实验室转写","segments":[{"text":"实验室转写","startMs":0,"endMs":1200,"speakerId":1}]}'
 `)
 
@@ -62,11 +62,15 @@ printf '%s' '{"text":"实验室转写","segments":[{"text":"实验室转写","st
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(gotArgs) != audioPath {
-		t.Fatalf("binary args = %q, want audio path %q", gotArgs, audioPath)
+	lines := strings.Split(strings.TrimSuffix(string(gotArgs), "\n"), "\n")
+	if len(lines) != 5 || lines[0] != "run" || lines[1] != "--audio" || lines[2] != audioPath || lines[3] != "--out-dir" || lines[4] == "" {
+		t.Fatalf("binary args = %q, want run --audio %s --out-dir <dir>", gotArgs, audioPath)
 	}
 	if strings.Contains(string(gotArgs), "model-proxy") || strings.Contains(string(gotArgs), "oss.invalid") {
 		t.Fatalf("binary received cloud URL or proxy path: %q", gotArgs)
+	}
+	if _, statErr := os.Stat(lines[4]); !os.IsNotExist(statErr) {
+		t.Fatalf("ephemeral out dir should be removed, stat=%v", statErr)
 	}
 
 	entry, ok := storage.FindByID(id)
@@ -210,6 +214,90 @@ printf '%s' '{"transcript":[{"content":"分段文本","startTime":5,"endTime":9}
 	want := "run\n--audio\n" + audio + "\n--apply-glossary\n"
 	if string(got) != want {
 		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestMapFunASRRunStdoutReadsTranscriptFile(t *testing.T) {
+	dir := t.TempDir()
+	transcript := filepath.Join(dir, "transcript.txt")
+	if err := os.WriteFile(transcript, []byte("实验室转写正文\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(map[string]any{
+		"status": "ok",
+		"paths": map[string]any{
+			"transcript_txt": transcript,
+			"summary_md":     filepath.Join(dir, "skip.md"),
+		},
+		"chars": 7,
+		"text":  "不要用这段",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := mapFunASROutput(raw)
+	if !result.OK || result.Text != "实验室转写正文" || result.SourceInfo.Provider != "funasr" {
+		t.Fatalf("run stdout mapping = %+v", result)
+	}
+
+	missingRaw, err := json.Marshal(map[string]any{
+		"status": "ok",
+		"paths":  map[string]any{"transcript_txt": filepath.Join(dir, "missing.txt")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := mapFunASROutput(missingRaw)
+	if missing.OK || !strings.Contains(missing.Error, "转写文件读取失败") {
+		t.Fatalf("missing transcript file = %+v", missing)
+	}
+	failedRaw, err := json.Marshal(map[string]any{
+		"status":  "error",
+		"message": "模型没起来",
+		"paths":   map[string]any{"transcript_txt": transcript},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := mapFunASROutput(failedRaw)
+	if failed.OK || !strings.Contains(failed.Error, "模型没起来") || failed.Text != "" {
+		t.Fatalf("non-ok status = %+v", failed)
+	}
+}
+
+func TestFunASRDefaultRunReadsTranscriptFile(t *testing.T) {
+	bin := writeFakeFunASR(t, `#!/bin/sh
+if [ "$1" != "run" ] || [ "$2" != "--audio" ] || [ "$4" != "--out-dir" ] || [ ! -d "$5" ]; then
+  echo "bad argv: $*" >&2
+  exit 2
+fi
+out=$5/transcript.txt
+printf '%s' '文件里的转写' > "$out"
+printf '{"status":"ok","paths":{"transcript_txt":"%s"},"chars":6}' "$out"
+`)
+	audio := filepath.Join(t.TempDir(), "clip.ogg")
+	if err := os.WriteFile(audio, []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := TranscribeAudio(audio, AsrConfig{Mode: "funasr", FunASR: &AsrFunASRConfig{Bin: bin}}, testLogger{t}, "https://oss.invalid/clip.ogg", 1000)
+	if !result.OK || result.Text != "文件里的转写" || result.SourceInfo.Provider != "funasr" {
+		t.Fatalf("default run result = %+v", result)
+	}
+}
+
+func TestExpandUserPath(t *testing.T) {
+	t.Parallel()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := expandUserPath("~/.openclaw/tools/yoooclaw-asr/bin/yoooclaw-asr")
+	want := filepath.Join(home, ".openclaw", "tools", "yoooclaw-asr", "bin", "yoooclaw-asr")
+	if got != want {
+		t.Fatalf("expand = %q, want %q", got, want)
+	}
+	if expandUserPath("/opt/yoooclaw-asr") != "/opt/yoooclaw-asr" {
+		t.Fatal("absolute path should stay absolute")
 	}
 }
 
