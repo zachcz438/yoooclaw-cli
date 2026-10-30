@@ -410,6 +410,38 @@ timezone.
 
 For ASR language hints, `auto` keeps provider-side detection. Use `zh-TW` for Traditional Chinese in a Taiwan context, or `zh-Hant` when only the Traditional Chinese script preference matters.
 
+#### Local FunASR (lab / proxied only)
+
+This fork adds `asr.mode=funasr`. `recordings.retranscribe` runs the local `yoooclaw-asr` CLI, reads the transcript, then follows the existing path: write the transcript, set status to `transcribed`, and emit `recording.status` with `transcript[]`. It does not call cloud model-proxy and does not bypass Credits.
+
+`~/.openclaw/tools/yoooclaw-asr/bin/yoooclaw-asr` is a multi-subcommand CLI. When `funasr.args` is omitted, the default invocation is:
+
+```text
+yoooclaw-asr run --audio <absolute local audio path> --out-dir <temp dir>
+```
+
+Stdout is JSON such as `{ "status": "ok", "paths": { "transcript_txt": "..." }, "chars": 47 }`. The transcript body is the file at `paths.transcript_txt`, not a top-level `text` field. The CLI creates the temp directory and removes it after reading the file. Do not point this mode at `retranscribe --recording-id`; that subcommand is the OpenClaw phone-notifications worker.
+
+Binary path order: `funasr.bin` (request body or `recordings/asr-config.json`; a leading `~/` is expanded) → `YOOOCLAW_ASR_BIN` → `~/.openclaw/tools/yoooclaw-asr/bin/yoooclaw-asr`. Leave `bin` empty when the tool is installed at the default path.
+
+```bash
+yoooclaw recording setup-asr --mode funasr --non-interactive
+```
+
+```json
+{ "mode": "funasr" }
+```
+
+Custom args may use `{audio}` and `{outdir}`. This is equivalent to the default:
+
+```json
+{ "mode": "funasr", "funasr": { "args": ["run", "--audio", "{audio}", "--out-dir", "{outdir}"] } }
+```
+
+Shims may still print `{text, segments}`, `transcript[]`, or plain text. Set `args` to `["{audio}"]` only for a tool whose sole argument is the audio path. Empty output, a status other than `ok`, an unreadable transcript file, or a non-zero exit fails the job and does not overwrite an existing transcript with an empty one. Optional `funasr.timeoutSec` defaults to 1800. The process is started with `exec` (no shell) and is not given the audio OSS URL or API key as arguments.
+
+Use this only in a lab, or when a host embeds the daemon as `proxied`. Do not install this standalone CLI on a production Mac that is already running OpenClaw phone-notifications, and do not run `owner activate`: the default `standalone` ingress conflicts with the existing Relay and writer lock. The phone app's transcribe button can still miss this Mac. This mode only makes the CLI store the transcript and emit `recording.status`; it does not by itself turn the app UI green.
+
 An unfiltered `voice list` returns the rolling last 72 hours and includes an explicit notice in JSON. Use `voice list --all` for all saved history. There is no default row-count limit.
 `voice apps` defaults to the rolling last seven days, deduplicates by `app_id`, and returns both the
 observed `app_id` and `app_name`; use `voice apps --all` for an explicit all-history inventory.

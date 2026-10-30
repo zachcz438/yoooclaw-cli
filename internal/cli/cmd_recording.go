@@ -32,11 +32,12 @@ func newRecordingCmd() *cobra.Command {
 	storagePath := &cobra.Command{Use: "storage-path", Short: "打印录音存储目录绝对路径 🟢", Args: cobra.NoArgs, RunE: run(recordingStoragePath)}
 
 	setupAsr := &cobra.Command{Use: "setup-asr", Short: "交互式配置 ASR 转写参数 🟢", Args: cobra.NoArgs, RunE: run(recordingSetupAsr)}
-	setupAsr.Flags().String("mode", "", "api | local（默认 api）")
+	setupAsr.Flags().String("mode", "", "api | funasr | local（默认 api；local Whisper 已停用）")
 	setupAsr.Flags().String("api-key", "", "api 模式：可选；留空则用 account ock- key")
 	setupAsr.Flags().String("endpoint", "", "api 模式：自定义 model-proxy 端点")
 	setupAsr.Flags().String("language", "", "api 模式：语言提示，如 auto / zh / zh-CN / zh-TW / zh-Hant / en")
 	setupAsr.Flags().String("model", "", "local 模式：Whisper 模型名")
+	setupAsr.Flags().String("bin", "", "funasr 模式：本地 FunASR CLI 路径；留空则用 YOOOCLAW_ASR_BIN 或默认路径")
 	setupAsr.Flags().Bool("non-interactive", false, "跳过向导，从参数构造配置")
 
 	events := &cobra.Command{Use: "events", Short: "查询录音状态事件流（JSONL）🟢", Args: cobra.NoArgs, RunE: run(recordingEvents)}
@@ -388,10 +389,11 @@ func recordingSetupAsr(ctx *clictx.Context, cmd *cobra.Command, _ []string) (any
 	endpoint := flagStr(cmd, "endpoint")
 	language := flagStr(cmd, "language")
 	model := flagStr(cmd, "model")
+	bin := flagStr(cmd, "bin")
 
 	if !flagBool(cmd, "non-interactive") && prompt.IsInteractive() {
 		var err error
-		if mode, err = prompt.Ask("ASR mode（api / local）", mode); err != nil {
+		if mode, err = prompt.Ask("ASR mode（api / funasr / local）", mode); err != nil {
 			return nil, err
 		}
 		mode = strings.ToLower(mode)
@@ -405,17 +407,21 @@ func recordingSetupAsr(ctx *clictx.Context, cmd *cobra.Command, _ []string) (any
 			if language, err = prompt.Ask("语言提示（auto / zh / zh-CN / zh-TW / zh-Hant / en）", firstNonEmpty(language, "auto")); err != nil {
 				return nil, err
 			}
+		} else if mode == "funasr" {
+			if bin, err = prompt.Ask("FunASR CLI 路径（留空则用 YOOOCLAW_ASR_BIN 或 ~/.openclaw/tools/yoooclaw-asr/bin/yoooclaw-asr）", bin); err != nil {
+				return nil, err
+			}
 		} else if mode == "local" {
 			if model, err = prompt.Ask("Whisper 模型（留空走推荐值）", model); err != nil {
 				return nil, err
 			}
 		}
 	}
-	if mode != "api" && mode != "local" {
-		return nil, errs.Newf(errs.CodeInvalidArgument, `--mode 必须是 api 或 local（收到 "%s"）`, mode)
+	if mode != "api" && mode != "local" && mode != "funasr" {
+		return nil, errs.Newf(errs.CodeInvalidArgument, `--mode 必须是 api、funasr 或 local（收到 "%s"）`, mode)
 	}
 
-	cfg := buildAsrConfig(mode, apiKey, endpoint, language, model)
+	cfg := buildAsrConfig(mode, apiKey, endpoint, language, model, bin)
 	if err := fsutil.EnsureDir(ctx.Paths.Recordings, fsutil.DirMode); err != nil {
 		return nil, err
 	}
@@ -434,7 +440,14 @@ func recordingSetupAsr(ctx *clictx.Context, cmd *cobra.Command, _ []string) (any
 	return map[string]any{"ok": true, "path": path, "mode": mode, "keyConfigured": keyConfigured}, nil
 }
 
-func buildAsrConfig(mode, apiKey, endpoint, language, model string) map[string]any {
+func buildAsrConfig(mode, apiKey, endpoint, language, model, bin string) map[string]any {
+	if mode == "funasr" {
+		bin = strings.TrimSpace(bin)
+		if bin == "" {
+			return map[string]any{"mode": mode}
+		}
+		return map[string]any{"mode": mode, "funasr": map[string]any{"bin": bin}}
+	}
 	if mode == "api" {
 		api := map[string]any{}
 		if apiKey != "" {

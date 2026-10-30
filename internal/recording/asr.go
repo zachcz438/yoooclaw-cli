@@ -31,9 +31,10 @@ var (
 
 // AsrConfig 是录音 ASR 配置。
 type AsrConfig struct {
-	Mode  string        `json:"mode"`
-	API   *AsrAPIConfig `json:"api,omitempty"`
-	Local any           `json:"local,omitempty"`
+	Mode   string           `json:"mode"`
+	API    *AsrAPIConfig    `json:"api,omitempty"`
+	Local  any              `json:"local,omitempty"`
+	FunASR *AsrFunASRConfig `json:"funasr,omitempty"`
 }
 
 // AsrAPIConfig 是 model-proxy 长录音配置。
@@ -59,7 +60,9 @@ type AsrInitResult struct {
 	Endpoint      string `json:"endpoint,omitempty"`
 	Language      string `json:"language,omitempty"`
 	KeyConfigured bool   `json:"keyConfigured,omitempty"`
-	Error         string `json:"error,omitempty"`
+	// Bin 是 funasr 模式解析出的本地 CLI 路径；云端 api 模式留空。
+	Bin   string `json:"bin,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 // TranscriptionResult 是 ASR provider 结果。
@@ -81,10 +84,10 @@ func ValidateAsrConfig(cfg *AsrConfig) string {
 		return "asr.mode is required"
 	}
 	switch cfg.Mode {
-	case "api":
+	case "api", "funasr":
 		return ""
 	case "local":
-		return `本地 Whisper 模式已停用，请改用 asr.mode = "api"`
+		return `本地 Whisper 模式已停用，请改用 asr.mode = "api" 或 "funasr"`
 	case "yoooclaw":
 		return "YoooClaw ASR 尚未实现（P2）"
 	default:
@@ -144,6 +147,10 @@ func InitializeAsr(cfg *AsrConfig) AsrInitResult {
 		}
 		return AsrInitResult{OK: false, Mode: mode, Error: errMsg}
 	}
+	// funasr 只检查本地二进制，不读取、不要求云端 API Key。
+	if cfg.Mode == "funasr" {
+		return initializeFunASR(cfg)
+	}
 	endpoint := resolveSubmitEndpoint(cfg.API)
 	keyConfigured := strings.TrimSpace(cfg.APIValue().APIKey) != "" || strings.TrimSpace(creds.ResolveAPIKey().Value) != ""
 	if !keyConfigured {
@@ -176,8 +183,11 @@ func TranscribeAudio(audioFilePath string, cfg AsrConfig, logger Logger, audioOs
 	switch cfg.Mode {
 	case "api":
 		return transcribeWithModelProxy(audioOssURL, audioDurationMS, cfg.API, logger)
+	case "funasr":
+		// 只把本地音频交给已安装的 FunASR CLI；不把 ossUrl / API Key 传给子进程，也不走 model-proxy。
+		return transcribeWithFunASR(audioFilePath, cfg.FunASR, logger)
 	case "local":
-		return TranscriptionResult{OK: false, Error: `本地 Whisper 模式已停用，请改用 asr.mode = "api"`}
+		return TranscriptionResult{OK: false, Error: `本地 Whisper 模式已停用，请改用 asr.mode = "api" 或 "funasr"`}
 	case "yoooclaw":
 		return TranscriptionResult{OK: false, Error: "YoooClaw ASR 尚未实现（P2）"}
 	default:

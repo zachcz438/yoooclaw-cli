@@ -402,6 +402,43 @@ yoooclaw monitor create daily-standup --schedule "0 9 * * 1-5" --match-rules '{"
 
 ASR 语言提示中，`auto` 表示保留 provider 侧自动识别；台湾繁体中文场景可使用 `zh-TW`，仅需指定繁体中文脚本时可使用 `zh-Hant`。
 
+#### 本地 FunASR（仅实验室 / proxied）
+
+本 fork 增加 `asr.mode=funasr`。`recordings.retranscribe` 会执行本机已经装好的 `yoooclaw-asr`，读出转写正文，再沿原来的转写流程落盘、把状态写成 `transcribed`，并发出带 `transcript[]` 的 `recording.status`。这个模式不调用云端 model-proxy，也不绕过 Credits。
+
+这台机器上的 `~/.openclaw/tools/yoooclaw-asr/bin/yoooclaw-asr` 是多子命令 CLI。未写 `funasr.args` 时，默认就是：
+
+```text
+yoooclaw-asr run --audio <本地音频绝对路径> --out-dir <临时目录>
+```
+
+标准输出是 JSON，形如 `{ "status": "ok", "paths": { "transcript_txt": "..." }, "chars": 47 }`。正文在 `paths.transcript_txt` 指向的文件里，不在顶层 `text`。临时目录由 CLI 创建，读完正文后删除。不要改成 `retranscribe --recording-id`：那是 OpenClaw phone-notifications 的 worker，不是这条 fork 路径。
+
+二进制路径按这个顺序取：`funasr.bin`（请求体或 `recordings/asr-config.json`；`~/` 会展开）→ 环境变量 `YOOOCLAW_ASR_BIN` → `~/.openclaw/tools/yoooclaw-asr/bin/yoooclaw-asr`。装在默认位置时不必写 `bin`。
+
+```bash
+yoooclaw recording setup-asr --mode funasr --non-interactive
+```
+
+```json
+{ "mode": "funasr" }
+```
+
+要改参数时，`{audio}` 和 `{outdir}` 会被替换。与默认等价的写法：
+
+```json
+{
+  "mode": "funasr",
+  "funasr": {
+    "args": ["run", "--audio", "{audio}", "--out-dir", "{outdir}"]
+  }
+}
+```
+
+垫片仍可用：标准输出可以是 `{text, segments}`、`transcript[]`，或纯文本。只想把音频路径当唯一参数时，把 `args` 设为 `["{audio}"]`。输出为空、`status` 不是 `ok`、转写文件读不到，或进程非零退出时，转写失败，不会用空稿覆盖已有结果。可选 `funasr.timeoutSec`（默认 1800 秒）。直接 `exec`，不经过 shell，也不把音频 OSS URL 或 API Key 当参数传入。
+
+只在实验环境使用，或由宿主以 `proxied` 嵌入。请勿在正在运行 OpenClaw phone-notifications 的生产 Mac 上安装这份独立 CLI，也请勿执行 `owner activate`：默认 `standalone` 会和现有 Relay、writer lock 冲突。手机 App 的「转写」按钮仍可能看不到这台 Mac；这里只保证 CLI 按既有协议落盘并推送 `recording.status`，不能单独让 App 界面变绿。
+
 不带任何筛选条件的 `voice list` 默认返回滚动最近 72 小时，并在 JSON 中明确提示；查询全部已保存历史请使用 `voice list --all`。命令没有默认条数上限。
 `voice apps` 默认查询滚动最近 7 天，按 `app_id` 去重并同时返回实际的 `app_id` 与
 `app_name`；显式查询全历史 App 清单请使用 `voice apps --all`。
