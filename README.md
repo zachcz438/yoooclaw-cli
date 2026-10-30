@@ -410,6 +410,24 @@ timezone.
 
 For ASR language hints, `auto` keeps provider-side detection. Use `zh-TW` for Traditional Chinese in a Taiwan context, or `zh-Hant` when only the Traditional Chinese script preference matters.
 
+#### Local FunASR (lab / proxied only)
+
+This fork adds `asr.mode=funasr`. `recordings.retranscribe` runs an existing local FunASR CLI, maps stdout into the current transcript shape, then follows the existing path: write the transcript, set status to `transcribed`, and emit `recording.status` with `transcript[]`. It does not call cloud model-proxy and does not bypass Credits.
+
+Binary path order: `funasr.bin` (request body or `recordings/asr-config.json`) → `YOOOCLAW_ASR_BIN` → `~/.openclaw/tools/yoooclaw-asr/bin/yoooclaw-asr`.
+
+```bash
+yoooclaw recording setup-asr --mode funasr --bin ~/.openclaw/tools/yoooclaw-asr/bin/yoooclaw-asr --non-interactive
+```
+
+```json
+{ "mode": "funasr", "funasr": { "bin": "/path/to/yoooclaw-asr", "args": ["--audio", "{audio}"] } }
+```
+
+The CLI `exec`s that binary directly (no shell) and does not pass the audio OSS URL or API key as arguments. With no `args`, the only argument is the absolute local audio path. `{audio}` in `args` is replaced with that path; otherwise the path is appended. Stdout is JSON (`text`, optional `segments` or `transcript`, times in milliseconds) or plain text. Empty output or a non-zero exit fails the job and does not overwrite an existing transcript with an empty one. Optional `funasr.timeoutSec` defaults to 1800.
+
+Use this only in a lab, or when a host embeds the daemon as `proxied`. Do not install this standalone CLI on a production Mac that is already running OpenClaw phone-notifications, and do not run `owner activate`: the default `standalone` ingress conflicts with the existing Relay and writer lock. The phone app's transcribe button can still miss this Mac. This mode only makes the CLI store the transcript and emit `recording.status`; it does not by itself turn the app UI green.
+
 An unfiltered `voice list` returns the rolling last 72 hours and includes an explicit notice in JSON. Use `voice list --all` for all saved history. There is no default row-count limit.
 `voice apps` defaults to the rolling last seven days, deduplicates by `app_id`, and returns both the
 observed `app_id` and `app_name`; use `voice apps --all` for an explicit all-history inventory.
